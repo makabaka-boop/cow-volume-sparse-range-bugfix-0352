@@ -72,12 +72,14 @@ type Volume struct {
 
 // FileInfo describes a single file. PhysicalBytes counts referenced slots;
 // a block shared by a clone is counted per referencing file here and once in
-// the volume totals.
+// the volume totals. SparseBytes is the file length not covered by a mapped
+// block slot.
 type FileInfo struct {
 	Name           string `json:"name"`
 	Length         int64  `json:"length"`
 	PhysicalBlocks int    `json:"physicalBlocks"`
 	PhysicalBytes  int64  `json:"physicalBytes"`
+	SparseBytes    int64  `json:"sparseBytes"`
 }
 
 // Stats describes volume occupancy. UsedBlocks is the number of distinct
@@ -226,9 +228,11 @@ func (v *Volume) Clone(src, dst string, expected int64) (newRev int64, err error
 }
 
 // Write overwrites len(data) bytes at offset, growing the file and creating
-// sparse holes as needed. Shared blocks are copied before the first
-// modification. It fails atomically (ErrQuota or ErrOutOfRange): no partial
-// writes and no leaked or miscounted references.
+// sparse holes as needed. A zero-length write is a validation-only no-op: it
+// does not grow the file even if offset is beyond EOF and does not advance the
+// revision. Shared blocks are copied before the first modification. Non-empty
+// writes fail atomically (ErrQuota or ErrOutOfRange): no partial writes and no
+// leaked or miscounted references.
 func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (newRev int64, err error) {
 	if !ValidateName(name) {
 		return 0, ErrInvalidName
@@ -248,20 +252,23 @@ func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (
 	if !ok {
 		return v.revision, ErrNotFound
 	}
+	if len(data) == 0 {
+		// A zero-length write changes neither bytes nor length and is not a
+		// revision-producing mutation, even when offset lies beyond EOF.
+		return v.revision, nil
+	}
 
 	end := offset + int64(len(data))
 
 	// Reservation phase: count every block we must allocate (holes and
 	// shared blocks that need copy-on-write).
 	need := 0
-	if len(data) > 0 {
-		first := offset / BlockSize
-		last := (end - 1) / BlockSize
-		for idx := first; idx <= last; idx++ {
-			id, present := f.blocks[idx]
-			if !present || v.blocks[id].refs > 1 {
-				need++
-			}
+	first := offset / BlockSize
+	last := (end - 1) / BlockSize
+	for idx := first; idx <= last; idx++ {
+		id, present := f.blocks[idx]
+		if !present || v.blocks[id].refs > 1 {
+			need++
 		}
 	}
 	if len(v.blocks)+need > MaxBlocks {
@@ -406,27 +413,34 @@ func (v *Volume) Delete(name string, expected int64) (newRev int64, err error) {
 // exactly at end-of-file returns an empty slice; starting past it is
 // ErrOutOfRange.
 func (v *Volume) Read(name string, offset, length int64) ([]byte, error) {
+	data, _, err := v.ReadWithRevision(name, offset, length)
+	return data, err
+}
+
+// ReadWithRevision performs Read atomically and also returns the revision the
+// data was read at.
+func (v *Volume) ReadWithRevision(name string, offset, length int64) ([]byte, int64, error) {
 	if !ValidateName(name) {
-		return nil, ErrInvalidName
-	}
-	if offset < 0 {
-		return nil, ErrOutOfRange
+		return nil, 0, ErrInvalidName
 	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	f, ok := v.files[name]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, v.revision, ErrNotFound
+	}
+	if offset < 0 || length > int64Max-offset {
+		return nil, v.revision, ErrOutOfRange
 	}
 	if offset > f.length {
-		return nil, ErrOutOfRange
+		return nil, v.revision, ErrOutOfRange
 	}
-	if length < 0 || offset+length > f.length {
+	if length < 0 || length > f.length-offset {
 		length = f.length - offset
 	}
 	buf := make([]byte, length)
 	if length == 0 {
-		return buf, nil
+		return buf, v.revision, nil
 	}
 	first := offset / BlockSize
 	last := (offset + length - 1) / BlockSize
@@ -446,13 +460,14 @@ func (v *Volume) Read(name string, offset, length int64) ([]byte, error) {
 		}
 		copy(buf[blkStart+lo-offset:], v.blocks[id].data[lo:hi])
 	}
-	return buf, nil
+	return buf, v.revision, nil
 }
 
 // Stats returns logical length and physical occupancy for the volume and each
 // file. UsedBlocks counts distinct physical blocks; a shared block is counted
-// once. SparseBytes is the logical length that maps to no physical block
-// (holes plus the unused tail of a partial last block).
+// once. SparseBytes is the number of logical bytes backed by holes rather than
+// physical storage. Bytes in an allocated but partially used tail block are
+// still physically backed and are therefore not sparse.
 func (v *Volume) Stats() Stats {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -474,15 +489,19 @@ func (v *Volume) Stats() Stats {
 	for _, n := range names {
 		f := v.files[n]
 		phys := len(f.blocks)
-		st.LogicalBytes += f.length
-		if s := f.length - int64(phys)*BlockSize; s > 0 {
-			st.SparseBytes += s
+		physicalBytes := int64(phys) * BlockSize
+		sparseBytes := f.length - physicalBytes
+		if sparseBytes < 0 {
+			sparseBytes = 0
 		}
+		st.LogicalBytes += f.length
+		st.SparseBytes += sparseBytes
 		st.Files = append(st.Files, FileInfo{
 			Name:           n,
 			Length:         f.length,
 			PhysicalBlocks: phys,
-			PhysicalBytes:  int64(phys) * BlockSize,
+			PhysicalBytes:  physicalBytes,
+			SparseBytes:    sparseBytes,
 		})
 	}
 	return st

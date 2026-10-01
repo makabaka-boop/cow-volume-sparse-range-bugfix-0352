@@ -126,16 +126,17 @@ func (m *model) write(name string, off int64, p []byte, rev int64) errKind {
 	if !ok {
 		return kNotFound
 	}
+	if len(p) == 0 {
+		return kOK
+	}
 	end := off + int64(len(p))
 	// Reservation identical to the real implementation: one block per hole or
 	// shared block touched.
 	need := 0
-	if len(p) > 0 {
-		for idx := off / BlockSize; idx <= (end-1)/BlockSize; idx++ {
-			id, present := f.phys[idx]
-			if !present || m.blocks[id].refs > 1 {
-				need++
-			}
+	for idx := off / BlockSize; idx <= (end-1)/BlockSize; idx++ {
+		id, present := f.phys[idx]
+		if !present || m.blocks[id].refs > 1 {
+			need++
 		}
 	}
 	if len(m.blocks)+need > MaxBlocks {
@@ -354,8 +355,8 @@ func (c *apiClient) createExpectExact(t *testing.T, path string, wantStatus int)
 }
 
 // checkStats compares the whole volume state to the model: revision, every
-// file's full content, per-file physical blocks and the distinct physical
-// block total.
+// file's full content, per-file physical and sparse byte accounting, and the
+// distinct physical block total.
 func checkStats(t *testing.T, c *apiClient, m *model, ctx string) {
 	t.Helper()
 	resp, err := c.hc.Get(c.srv.URL + "/stats")
@@ -377,6 +378,8 @@ func checkStats(t *testing.T, c *apiClient, m *model, ctx string) {
 		t.Fatalf("[%s] physical blocks: server=%d model=%d (free=%d)",
 			ctx, st.UsedBlocks, len(m.blocks), st.FreeBlocks)
 	}
+
+	var wantSparse int64
 	byName := map[string]FileInfo{}
 	for _, fi := range st.Files {
 		byName[fi.Name] = fi
@@ -386,12 +389,22 @@ func checkStats(t *testing.T, c *apiClient, m *model, ctx string) {
 		if !ok {
 			t.Fatalf("[%s] file %q missing from stats", ctx, name)
 		}
-		if fi.Length != int64(len(mf.data)) {
-			t.Fatalf("[%s] %s length: server=%d model=%d", ctx, name, fi.Length, len(mf.data))
+		fileLength := int64(len(mf.data))
+		wantFileSparse := fileLength - int64(len(mf.phys))*BlockSize
+		if wantFileSparse < 0 {
+			wantFileSparse = 0
+		}
+		wantSparse += wantFileSparse
+		if fi.Length != fileLength {
+			t.Fatalf("[%s] %s length: server=%d model=%d", ctx, name, fi.Length, fileLength)
 		}
 		if fi.PhysicalBlocks != len(mf.phys) {
 			t.Fatalf("[%s] %s physblocks: server=%d model=%d", ctx, name, fi.PhysicalBlocks, len(mf.phys))
 		}
+		if fi.SparseBytes != wantFileSparse {
+			t.Fatalf("[%s] %s sparsebytes: server=%d model=%d", ctx, name, fi.SparseBytes, wantFileSparse)
+		}
+
 		// Full content comparison (the naive byte array is the oracle).
 		raw, status, _ := c.read(name, 0, -1)
 		if status != http.StatusOK {
@@ -404,6 +417,9 @@ func checkStats(t *testing.T, c *apiClient, m *model, ctx string) {
 			}
 			t.Fatalf("[%s] %s content mismatch at byte %d (slen=%d mlen=%d)", ctx, name, i, len(raw), len(mf.data))
 		}
+	}
+	if st.SparseBytes != wantSparse {
+		t.Fatalf("[%s] sparse bytes: server=%d model=%d", ctx, st.SparseBytes, wantSparse)
 	}
 }
 
@@ -525,6 +541,83 @@ func TestHTTPSparseAndRangeRead(t *testing.T) {
 	}
 }
 
+// TestHTTPSparseStatsZeroWriteAndRangeOverflows pins the boundary behavior
+// for sparse accounting, zero-length writes, and range requests whose numeric
+// end cannot be represented.
+func TestHTTPSparseStatsZeroWriteAndRangeOverflows(t *testing.T) {
+	c := newAPIClient(t)
+	m := newModel()
+
+	c.createExpectExact(t, "/create?name=h&rev=0", http.StatusOK)
+	m.create("h", 0)
+	off := int64(3*BlockSize + 10)
+	nr, status := c.write("h", off, []byte{0x42}, 1)
+	if status != http.StatusOK || nr != 2 {
+		t.Fatalf("write status=%d rev=%d", status, nr)
+	}
+	m.write("h", off, []byte{0x42}, 1)
+	nr, status = c.clone("h", "c", 2)
+	if status != http.StatusOK || nr != 3 {
+		t.Fatalf("clone status=%d rev=%d", status, nr)
+	}
+	m.clone("h", "c", 2)
+
+	stats := func() Stats {
+		t.Helper()
+		resp, err := c.hc.Get(c.srv.URL + "/stats")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var st Stats
+		if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	st := stats()
+	if st.Revision != 3 || st.UsedBlocks != 1 || st.SparseBytes != 6*BlockSize {
+		t.Fatalf("aggregate stats wrong: %+v", st)
+	}
+	for _, fi := range st.Files {
+		if fi.Length != off+1 || fi.PhysicalBlocks != 1 || fi.SparseBytes != 3*BlockSize {
+			t.Fatalf("file stats wrong: %+v", fi)
+		}
+	}
+
+	// A zero-length write past EOF validates name/revision but must not grow
+	// the file, allocate a block, or publish a new revision.
+	nr, status = c.write("h", 1<<50, nil, 3)
+	if status != http.StatusOK || nr != 3 {
+		t.Fatalf("zero write status=%d rev=%d", status, nr)
+	}
+	if st = stats(); st.Revision != 3 || st.SparseBytes != 6*BlockSize || st.UsedBlocks != 1 {
+		t.Fatalf("zero write changed stats: %+v", st)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		offset int64
+		length int64
+	}{
+		{"start past eof", off + 1, 1},
+		{"sum overflow", 1, int64Max},
+		{"sum overflow from valid range", off, int64Max},
+	} {
+		raw, gotStatus, hrev := c.read("h", tc.offset, tc.length)
+		if gotStatus != http.StatusRequestedRangeNotSatisfiable {
+			t.Fatalf("%s: status=%d want 416 body=%q", tc.name, gotStatus, raw)
+		}
+		if hrev != "3" {
+			t.Fatalf("%s: X-Revision=%q want 3", tc.name, hrev)
+		}
+	}
+
+	if raw, gotStatus, hrev := c.read("h", off+1, 0); gotStatus != http.StatusOK || len(raw) != 0 || hrev != "3" {
+		t.Fatalf("read at EOF: status=%d len=%d rev=%s", gotStatus, len(raw), hrev)
+	}
+}
+
 // TestHTTPQuotaForkExhaustion uses the real quota: fill the volume with a
 // file, clone it (zero extra blocks), then force COW on all blocks.
 func TestHTTPQuotaForkExhaustion(t *testing.T) {
@@ -633,7 +726,7 @@ func fuzzOnce(t *testing.T, seed int64) {
 			}
 			size := rng.Intn(3 * BlockSize)
 			if rng.Intn(10) == 0 {
-				size = 0 // zero-length writes bump revision only
+				size = 0 // zero-length writes are validation-only no-ops
 			}
 			p := make([]byte, size)
 			for i := range p {

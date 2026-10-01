@@ -1,7 +1,9 @@
 package vfs
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -15,8 +17,12 @@ func TestHTTPConcurrentSameRevision(t *testing.T) {
 	srv := httptest.NewServer(NewServer(New()).Handler())
 	defer srv.Close()
 
-	post := func(path string) (int, int64) {
-		resp, err := srv.Client().Post(srv.URL+path, "application/json", nil)
+	post := func(path string, body []byte) (int, int64) {
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		resp, err := srv.Client().Post(srv.URL+path, "application/octet-stream", rdr)
 		if err != nil {
 			t.Error(err)
 			return 0, -1
@@ -29,7 +35,7 @@ func TestHTTPConcurrentSameRevision(t *testing.T) {
 		return resp.StatusCode, mr.Revision
 	}
 
-	if code, _ := post("/create?name=f&rev=0"); code != http.StatusOK {
+	if code, _ := post("/create?name=f&rev=0", nil); code != http.StatusOK {
 		t.Fatalf("create code=%d", code)
 	}
 
@@ -41,10 +47,9 @@ func TestHTTPConcurrentSameRevision(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			// Zero-length write: still a committed mutation that bumps the
-			// revision, so the single-winner guarantee is testable without a
-			// request body.
-			codes[i], revs[i] = post("/write?name=f&offset=0&rev=1")
+			// A one-byte write is a real mutation, so the single-winner
+			// guarantee is testable while zero-length writes remain no-ops.
+			codes[i], revs[i] = post("/write?name=f&offset=0&rev=1", []byte{0x5A})
 		}(i)
 	}
 	wg.Wait()
@@ -67,8 +72,12 @@ func TestHTTPConcurrentSameRevision(t *testing.T) {
 		t.Fatalf("exactly one writer must win, got %d/%d", ok, n)
 	}
 
-	// Empty write body => zero-length mutation, but it still is a mutation.
-	// Volume must now sit at revision 2 with an empty file.
+	// An empty write body is validation-only and is not a mutation, even at a
+	// far offset. The volume must remain at revision 2 with a one-byte file.
+	noOpCode, noOpRev := post("/write?name=f&offset=1048576&rev=2", nil)
+	if noOpCode != http.StatusOK || noOpRev != 2 {
+		t.Fatalf("zero write code=%d rev=%d", noOpCode, noOpRev)
+	}
 	resp, err := srv.Client().Get(srv.URL + "/stats")
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +90,7 @@ func TestHTTPConcurrentSameRevision(t *testing.T) {
 	if st.Revision != 2 {
 		t.Fatalf("revision=%d want 2", st.Revision)
 	}
-	if st.LogicalFiles != 1 || st.UsedBlocks != 0 {
+	if st.LogicalFiles != 1 || st.UsedBlocks != 1 || st.Files[0].Length != 1 {
 		t.Fatalf("unexpected stats: %+v", st)
 	}
 }

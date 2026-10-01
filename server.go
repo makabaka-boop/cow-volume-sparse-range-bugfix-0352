@@ -248,14 +248,14 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	data, err := s.Vol.Read(r.URL.Query().Get("name"), offset, length)
+	data, revision, err := s.Vol.ReadWithRevision(r.URL.Query().Get("name"), offset, length)
 	if err != nil {
+		w.Header().Set("X-Revision", strconv.FormatInt(revision, 10))
 		writeError(w, statusFor(err), err)
 		return
 	}
-	st := s.Vol.Stats()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Revision", strconv.FormatInt(st.Revision, 10))
+	w.Header().Set("X-Revision", strconv.FormatInt(revision, 10))
 	w.Header().Set("X-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
