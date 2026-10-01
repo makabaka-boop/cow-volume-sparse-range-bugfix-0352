@@ -107,11 +107,25 @@ func TestSparseHoles(t *testing.T) {
 	if fi.Length != wantLen || fi.PhysicalBlocks != 1 {
 		t.Fatalf("file stats wrong: %+v", fi)
 	}
-	// Logical bytes with no physical content: the 10 full hole blocks plus
-	// the unused tail of the partial last block.
-	wantSparse := wantLen - BlockSize
+	// Logical bytes with no backing block: the 10 full hole blocks. The 100
+	// bytes before the written byte live in the same materialized block and
+	// are therefore not storage holes even though they read as zero.
+	wantSparse := int64(10 * BlockSize)
+	wantMapped := wantLen - wantSparse // only the in-file part of block 10
 	if st.SparseBytes != wantSparse {
 		t.Fatalf("sparse bytes = %d, want %d", st.SparseBytes, wantSparse)
+	}
+	if st.SparseBytes+wantMapped != wantLen {
+		t.Fatalf("sparse+mapped = %d, want length %d", st.SparseBytes+wantMapped, wantLen)
+	}
+	if _, err := v.Write("s", wantLen, nil, rev); err != nil {
+		t.Fatalf("zero write at EOF: %v", err)
+	}
+	if after := v.Stats(); after.SparseBytes != wantSparse || after.Files[0].Length != wantLen || after.Revision != rev {
+		t.Fatalf("zero write changed stats: %+v (want sparse=%d, length=%d, rev=%d)", after, wantSparse, wantLen, rev)
+	}
+	if _, err := v.Write("s", wantLen+1, nil, rev); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("zero write past EOF: %v", err)
 	}
 	_ = rev
 }
@@ -379,14 +393,22 @@ func TestRevisionConflict(t *testing.T) {
 		t.Fatal("failed mutations must not bump revision")
 	}
 
-	// No-op mutations still bump the revision.
+	// Truncate is still an explicit mutation when the size is unchanged.
 	nr, err := v.Truncate("r", 0, 1)
 	if err != nil || nr != 2 {
 		t.Fatalf("same-size truncate: rev=%d err=%v", nr, err)
 	}
+	// A zero-length write is not a mutation and must not grow the file or
+	// advance the revision.
 	nr, err = v.Write("r", 0, nil, 2)
-	if err != nil || nr != 3 {
+	if err != nil || nr != 2 {
 		t.Fatalf("zero write: rev=%d err=%v", nr, err)
+	}
+	if _, err := v.Write("r", 100, nil, 2); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("zero write past EOF: %v", err)
+	}
+	if v.Revision() != 2 {
+		t.Fatal("zero-length write changed revision")
 	}
 }
 
@@ -501,6 +523,12 @@ func TestReadRanges(t *testing.T) {
 	}
 	if _, err := v.Read("rd", -1, 1); !errors.Is(err, ErrOutOfRange) {
 		t.Fatalf("negative offset: %v", err)
+	}
+	if _, _, err := v.ReadWithRevision("rd", 1, int64Max); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("overflowing range: %v", err)
+	}
+	if _, _, err := v.ReadWithRevision("rd", int64Max, 1); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("overflowing end: %v", err)
 	}
 	_ = nr
 }

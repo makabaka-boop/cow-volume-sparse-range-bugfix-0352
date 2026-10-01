@@ -35,7 +35,8 @@ var (
 	// the current volume revision.
 	ErrConflict = errors.New("vfs: revision conflict")
 	// ErrOutOfRange is returned when an offset is negative, an offset+length
-	// sum overflows, or a read starts past the end of the file.
+	// sum overflows, a read starts past the end of the file, or a zero-length
+	// write starts past the end of an existing file.
 	ErrOutOfRange = errors.New("vfs: offset out of range")
 	// ErrQuota is returned when an operation cannot reserve enough free
 	// physical blocks. Nothing is mutated in that case.
@@ -229,6 +230,10 @@ func (v *Volume) Clone(src, dst string, expected int64) (newRev int64, err error
 // sparse holes as needed. Shared blocks are copied before the first
 // modification. It fails atomically (ErrQuota or ErrOutOfRange): no partial
 // writes and no leaked or miscounted references.
+//
+// A zero-length write is a no-op (including its revision) when offset is at or
+// before EOF; it cannot extend a file. A zero-length write starting past EOF
+// returns ErrOutOfRange without changing state.
 func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (newRev int64, err error) {
 	if !ValidateName(name) {
 		return 0, ErrInvalidName
@@ -247,6 +252,12 @@ func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (
 	f, ok := v.files[name]
 	if !ok {
 		return v.revision, ErrNotFound
+	}
+	if len(data) == 0 {
+		if offset > f.length {
+			return v.revision, ErrOutOfRange
+		}
+		return v.revision, nil
 	}
 
 	end := offset + int64(len(data))
@@ -404,29 +415,40 @@ func (v *Volume) Delete(name string, expected int64) (newRev int64, err error) {
 // Read returns up to length bytes starting at offset. A negative length reads
 // to the end of the file. Sparse holes yield zero bytes. Starting a read
 // exactly at end-of-file returns an empty slice; starting past it is
-// ErrOutOfRange.
+// ErrOutOfRange. A positive length whose sum with offset overflows int64 also
+// returns ErrOutOfRange.
 func (v *Volume) Read(name string, offset, length int64) ([]byte, error) {
+	data, _, err := v.ReadWithRevision(name, offset, length)
+	return data, err
+}
+
+// ReadWithRevision is Read and also returns the revision of the file snapshot
+// represented by the returned bytes.
+func (v *Volume) ReadWithRevision(name string, offset, length int64) (data []byte, revision int64, err error) {
 	if !ValidateName(name) {
-		return nil, ErrInvalidName
+		return nil, 0, ErrInvalidName
 	}
 	if offset < 0 {
-		return nil, ErrOutOfRange
+		return nil, 0, ErrOutOfRange
 	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	f, ok := v.files[name]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, v.revision, ErrNotFound
 	}
 	if offset > f.length {
-		return nil, ErrOutOfRange
+		return nil, v.revision, ErrOutOfRange
+	}
+	if length >= 0 && length > int64Max-offset {
+		return nil, v.revision, ErrOutOfRange
 	}
 	if length < 0 || offset+length > f.length {
 		length = f.length - offset
 	}
 	buf := make([]byte, length)
 	if length == 0 {
-		return buf, nil
+		return buf, v.revision, nil
 	}
 	first := offset / BlockSize
 	last := (offset + length - 1) / BlockSize
@@ -446,13 +468,14 @@ func (v *Volume) Read(name string, offset, length int64) ([]byte, error) {
 		}
 		copy(buf[blkStart+lo-offset:], v.blocks[id].data[lo:hi])
 	}
-	return buf, nil
+	return buf, v.revision, nil
 }
 
 // Stats returns logical length and physical occupancy for the volume and each
 // file. UsedBlocks counts distinct physical blocks; a shared block is counted
-// once. SparseBytes is the logical length that maps to no physical block
-// (holes plus the unused tail of a partial last block).
+// once. SparseBytes is the logical-file space not backed by a physical block
+// slot; a materialized partial last block only counts its in-file bytes as
+// backed. PhysicalBytes continues to report whole allocated blocks.
 func (v *Volume) Stats() Stats {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -475,9 +498,19 @@ func (v *Volume) Stats() Stats {
 		f := v.files[n]
 		phys := len(f.blocks)
 		st.LogicalBytes += f.length
-		if s := f.length - int64(phys)*BlockSize; s > 0 {
-			st.SparseBytes += s
+		var backed int64
+		for idx := range f.blocks {
+			start := idx * BlockSize
+			if start >= f.length {
+				continue
+			}
+			end := start + BlockSize
+			if end > f.length {
+				end = f.length
+			}
+			backed += end - start
 		}
+		st.SparseBytes += f.length - backed
 		st.Files = append(st.Files, FileInfo{
 			Name:           n,
 			Length:         f.length,

@@ -126,6 +126,12 @@ func (m *model) write(name string, off int64, p []byte, rev int64) errKind {
 	if !ok {
 		return kNotFound
 	}
+	if len(p) == 0 {
+		if off > int64(len(f.data)) {
+			return kRange
+		}
+		return kOK
+	}
 	end := off + int64(len(p))
 	// Reservation identical to the real implementation: one block per hole or
 	// shared block touched.
@@ -381,17 +387,37 @@ func checkStats(t *testing.T, c *apiClient, m *model, ctx string) {
 	for _, fi := range st.Files {
 		byName[fi.Name] = fi
 	}
+	var wantSparse int64
 	for name, mf := range m.files {
 		fi, ok := byName[name]
 		if !ok {
 			t.Fatalf("[%s] file %q missing from stats", ctx, name)
 		}
-		if fi.Length != int64(len(mf.data)) {
-			t.Fatalf("[%s] %s length: server=%d model=%d", ctx, name, fi.Length, len(mf.data))
+		length := int64(len(mf.data))
+		var backed int64
+		for idx := range mf.phys {
+			start := idx * BlockSize
+			if start >= length {
+				continue
+			}
+			end := start + BlockSize
+			if end > length {
+				end = length
+			}
+			backed += end - start
+		}
+		wantSparse += length - backed
+		if fi.Length != length {
+			t.Fatalf("[%s] %s length: server=%d model=%d", ctx, name, fi.Length, length)
 		}
 		if fi.PhysicalBlocks != len(mf.phys) {
 			t.Fatalf("[%s] %s physblocks: server=%d model=%d", ctx, name, fi.PhysicalBlocks, len(mf.phys))
 		}
+	}
+	if st.SparseBytes != wantSparse {
+		t.Fatalf("[%s] sparse bytes: server=%d model=%d", ctx, st.SparseBytes, wantSparse)
+	}
+	for name, mf := range m.files {
 		// Full content comparison (the naive byte array is the oracle).
 		raw, status, _ := c.read(name, 0, -1)
 		if status != http.StatusOK {
@@ -487,6 +513,29 @@ func TestHTTPSparseAndRangeRead(t *testing.T) {
 	}
 	m.write("h", off, p, 1)
 	checkStats(t, c, m, "sparse write")
+
+	// Zero-byte writes are not mutations: they neither extend a file nor bump
+	// the revision. One past EOF is still a stable range error.
+	fileLen := int64(len(m.files["h"].data))
+	if nr, st := c.write("h", fileLen, nil, 1); st != http.StatusOK || nr != 1 {
+		t.Fatalf("zero write at EOF: status=%d rev=%d", st, nr)
+	}
+	if _, st := c.write("h", fileLen+1, nil, 1); st != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("zero write past EOF status=%d", st)
+	}
+
+	// Offset and length values that individually fit in int64 must not make
+	// the server panic when their sum overflows; they are 416 responses.
+	_, st, hrev := c.read("h", 1, int64Max)
+	if st != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("overflowing read status=%d", st)
+	}
+	if hrev != "1" {
+		t.Fatalf("range error X-Revision=%q, want 1", hrev)
+	}
+	if _, st, hrev := c.read("h", fileLen+1, -1); st != http.StatusRequestedRangeNotSatisfiable || hrev != "1" {
+		t.Fatalf("past EOF read status=%d X-Revision=%q", st, hrev)
+	}
 
 	// Random windows, including fully sparse, straddling, and EOF cases.
 	rng := rand.New(rand.NewSource(42))
@@ -633,7 +682,7 @@ func fuzzOnce(t *testing.T, seed int64) {
 			}
 			size := rng.Intn(3 * BlockSize)
 			if rng.Intn(10) == 0 {
-				size = 0 // zero-length writes bump revision only
+				size = 0 // zero-length writes are no-ops at or before EOF
 			}
 			p := make([]byte, size)
 			for i := range p {
